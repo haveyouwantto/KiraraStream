@@ -7,8 +7,11 @@ from tinytag import TinyTag
 from datetime import datetime
 from PIL import Image
 import io
+import sys
+import json
 
 from lrcparser import LrcParser
+import traceback
 
 app = Flask(__name__)
 db = sqlite3.connect('music_database.db')
@@ -48,14 +51,13 @@ with db:
         );
     ''')
 
-music_dir = 'music'
 cache_dir = './.cache/'
 
 default_cover_image = os.path.join(cache_dir,'default.jpg')
 if not os.path.exists(default_cover_image):
 
     # Load the image using PIL
-    image = Image.open('../frontend/dist/default.png').convert('RGB')
+    image = Image.open('../frontend/resources/assets/default.png').convert('RGB')
 
     # Save the resized image to the cache path
     image.save(default_cover_image, format='JPEG')  # You can adjust the format as needed
@@ -189,6 +191,49 @@ def staticfile(file):
     else:
         return "404", 404
     
+import os
+import hashlib
+from datetime import datetime
+from PIL import Image
+import io
+from tinytag import TinyTag
+
+def process_tags(file_path):
+    tags = TinyTag.get(file_path, image=True)
+    return {
+        "disc": tags.disc,
+        "track": tags.track,
+        "title": tags.title or os.path.basename(file_path),
+        "artist": tags.artist,
+        "artist_id": hashlib.sha1(tags.artist.encode() if tags.artist else b'').hexdigest(),
+        "duration": tags.duration,
+        "album_title": tags.album.strip() if tags.album else None,
+        "album_id": hashlib.sha1(tags.album.encode() if tags.album else b'').hexdigest(),
+        "formats": os.path.splitext(file_path)[-1][1:].upper(),
+        "bit_depth": tags.bitdepth,
+        "bitrate": tags.bitrate,
+        "sample_rate": tags.samplerate,
+        "year":tags.year
+    }
+
+def process_cover(file_path, cache_dir):
+    tags = TinyTag.get(file_path, image=True)
+    cover = tags.get_image()
+
+    if cover:
+        cover_id = hashlib.sha1(cover).hexdigest()
+        cover_path = os.path.join(cache_dir, cover_id[:2], cover_id)
+        os.makedirs(os.path.dirname(cover_path), exist_ok=True)
+
+        image = Image.open(io.BytesIO(cover)).convert('RGB')
+        max_width = 768
+        max_height = 768
+        image.thumbnail((max_width, max_height), Image.ANTIALIAS)
+        image.save(cover_path, format='JPEG')
+
+        return cover_id
+    else:
+        return 'default'
 
 def process_song_file(file_path, db, cache_dir):
     file_hash = hashlib.sha1(file_path.encode()).hexdigest()
@@ -203,50 +248,31 @@ def process_song_file(file_path, db, cache_dir):
         if existing_song:
             return
 
-        tags = TinyTag.get(file_path, image=True)
-        song_id = file_hash
-        disc = tags.disc
-        title = tags.title or os.path.basename(file_path)
-        track = tags.track
-        artist = tags.artist
-        artist_id = hashlib.sha1(artist.encode() if artist else b'').hexdigest()
-        duration = tags.duration
-        album_title = tags.album.strip() if tags.album else None
-        album_id = hashlib.sha1(album_title.encode() if album_title else b'').hexdigest()
-        cover = tags.get_image()
-        cover_id = 'default'
-        formats = os.path.splitext(file_path)[-1][1:].upper()
-        bit_depth = tags.bitdepth
-        bitrate = tags.bitrate
-        sample_rate = tags.samplerate
-        has_lyrics = detect_lyrics(file_path)  # Implement the lyrics detection function
-
-        if cover:
-            cover_id = hashlib.sha1(cover).hexdigest()
-            cover_path = os.path.join(cache_dir, cover_id[:2], cover_id)
-            os.makedirs(os.path.dirname(cover_path), exist_ok=True)
-
-            image = Image.open(io.BytesIO(cover)).convert('RGB')
-            max_width = 768
-            max_height = 768
-            image.thumbnail((max_width, max_height), Image.ANTIALIAS)
-            image.save(cover_path, format='JPEG')
+        tags = process_tags(file_path)
+        cover_id = process_cover(file_path,cache_dir)
 
         cursor = db.cursor()
-        cursor.execute('SELECT * FROM albums WHERE id = ?', (album_id,))
+        cursor.execute('SELECT * FROM albums WHERE id = ?', (tags["album_id"],))
         album_row = cursor.fetchone()
 
         if not album_row:
             db.execute('INSERT OR REPLACE INTO albums VALUES (?, ?, ?, ?, ?, ?)',
-                       (album_id, album_title, artist, artist_id, tags.year, cover_id))
+                       (tags["album_id"], tags["album_title"], tags["artist"], tags["artist_id"], tags["year"], cover_id))
+
+
+        has_lyrics = detect_lyrics(file_path)
 
         db.execute('INSERT OR REPLACE INTO songs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                   (song_id, disc, track, title, artist, artist_id, duration, album_title, album_id,
-                    file_path, modified_date, cover_id, formats, bit_depth, bitrate, sample_rate, has_lyrics))
+                   (file_hash, tags["disc"], tags["track"], tags["title"], tags["artist"], tags["artist_id"], tags["duration"],
+                    tags["album_title"], tags["album_id"], file_path, modified_date, cover_id, tags["formats"],
+                    tags["bit_depth"], tags["bitrate"], tags["sample_rate"], has_lyrics))
+
+        return True
 
     except Exception as e:
         print(f'Failed to process {file_path}')
-        print(e)
+        traceback.print_exc()
+
 
 def get_lyrics_path(file_path):
     # Get the directory and filename components of the file path
@@ -261,14 +287,53 @@ def get_lyrics_path(file_path):
 def detect_lyrics(file_path):
     return os.path.exists(get_lyrics_path(file_path))
 
+
+def scan_existing(db):
+    with db:
+        cursor = db.cursor()
+        cursor.execute('SELECT id, path FROM songs')
+        existing_songs = cursor.fetchall()
+
+        for song_id, file_path in existing_songs:
+            if not os.path.exists(file_path):
+                cursor.execute('DELETE FROM songs WHERE id = ?', (song_id,))
+                print(f'Removed song {song_id} (no longer exists)', end='\r')
+                sys.stdout.flush()
+            else:
+                modified_date = datetime.fromtimestamp(os.path.getmtime(file_path))
+                cursor.execute('SELECT modified_date, has_lyrics FROM songs WHERE id = ?', (song_id,))
+                current_modified_date, current_has_lyrics = cursor.fetchone()
+
+                if modified_date != current_modified_date:
+                    has_lyrics = detect_lyrics(file_path)
+                    if has_lyrics != current_has_lyrics:
+                        db.execute('UPDATE songs SET modified_date = ?, has_lyrics = ? WHERE id = ?',
+                                (modified_date, has_lyrics, song_id))
+                        print(f'Updated song {song_id}', end='\r')
+                        sys.stdout.flush()
+
+
+def scan_all_dirs():
+    with open('config.json', 'r') as config_file:
+        config = json.load(config_file)
+        music_directories = config.get("music_directories", [])
+
+        for music_dir in music_directories:
+            scan_music_directory(music_dir)
+
 def scan_music_directory(directory):
+    new_songs = 0
     with db:
         for root, dirs, files in os.walk(directory):
             for file in files:
-                if file.lower().endswith(('.mp3', '.flac', '.wav','.ogg','.opus','.m4a')):
+                if file.lower().endswith(('.mp3', '.flac', '.wav', '.ogg', '.opus', '.m4a')):
                     file_path = os.path.join(root, file)
-                    process_song_file(file_path,db,cache_dir)
+                    if process_song_file(file_path, db, cache_dir):
+                        new_songs += 1
+                        print(f'Added {new_songs} new songs', end='\r')
+                        sys.stdout.flush()
 
 if __name__ == '__main__':
-    scan_music_directory(music_dir)
+    scan_existing(db)
+    scan_all_dirs()
     app.run(host='0.0.0.0')

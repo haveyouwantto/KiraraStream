@@ -40,9 +40,7 @@ class LrcParser:
         self.lrc['lyrics'].append({'time':timestamp,'text':text})
 
     def finalize(self):
-        if self.current_lyric:
-            self.lyrics.append(self.current_lyric)
-        self.current_lyric = None
+        self.parse_tag(self.buffer)
 
     def parse(self):
         with open(self.file_path, "r", encoding=self.encoding) as file:
