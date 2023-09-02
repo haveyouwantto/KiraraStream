@@ -61,6 +61,12 @@ if not os.path.exists(default_cover_image):
 
     # Save the resized image to the cache path
     image.save(default_cover_image, format='JPEG')  # You can adjust the format as needed
+
+def first_non_null(*args):
+    for arg in args:
+        if arg is not None:
+            return arg
+    return None  # Return None if all arguments are None
     
 def generate_song_dict(row):
     return {
@@ -200,15 +206,17 @@ from tinytag import TinyTag
 
 def process_tags(file_path):
     tags = TinyTag.get(file_path, image=True)
+    album_title = first_non_null(tags.album, f"[{os.path.basename(os.path.dirname(file_path))}]").strip()
     return {
         "disc": tags.disc,
         "track": tags.track,
         "title": tags.title or os.path.basename(file_path),
         "artist": tags.artist,
-        "artist_id": hashlib.sha1(tags.artist.encode() if tags.artist else b'').hexdigest(),
+        "artist_id": hashlib.sha1(first_non_null(tags.artist,'').encode()).hexdigest(),
         "duration": tags.duration,
-        "album_title": tags.album.strip() if tags.album else None,
-        "album_id": hashlib.sha1(tags.album.encode() if tags.album else b'').hexdigest(),
+        "album_artist":first_non_null(tags.albumartist,tags.artist,''),
+        "album_title": album_title,
+        "album_id": hashlib.sha1(album_title.encode()).hexdigest(),
         "formats": os.path.splitext(file_path)[-1][1:].upper(),
         "bit_depth": tags.bitdepth,
         "bitrate": tags.bitrate,
@@ -223,13 +231,14 @@ def process_cover(file_path, cache_dir):
     if cover:
         cover_id = hashlib.sha1(cover).hexdigest()
         cover_path = os.path.join(cache_dir, cover_id[:2], cover_id)
-        os.makedirs(os.path.dirname(cover_path), exist_ok=True)
+        if not os.path.exists(cover_path):
+            os.makedirs(os.path.dirname(cover_path), exist_ok=True)
 
-        image = Image.open(io.BytesIO(cover)).convert('RGB')
-        max_width = 768
-        max_height = 768
-        image.thumbnail((max_width, max_height), Image.ANTIALIAS)
-        image.save(cover_path, format='JPEG')
+            image = Image.open(io.BytesIO(cover)).convert('RGB')
+            max_width = 768
+            max_height = 768
+            image.thumbnail((max_width, max_height), Image.ANTIALIAS)
+            image.save(cover_path, format='JPEG')
 
         return cover_id
     else:
@@ -257,7 +266,7 @@ def process_song_file(file_path, db, cache_dir):
 
         if not album_row:
             db.execute('INSERT OR REPLACE INTO albums VALUES (?, ?, ?, ?, ?, ?)',
-                       (tags["album_id"], tags["album_title"], tags["artist"], tags["artist_id"], tags["year"], cover_id))
+                       (tags["album_id"], tags["album_title"], tags["album_artist"], tags["artist_id"], tags["year"], cover_id))
 
 
         has_lyrics = detect_lyrics(file_path)
@@ -287,7 +296,6 @@ def get_lyrics_path(file_path):
 def detect_lyrics(file_path):
     return os.path.exists(get_lyrics_path(file_path))
 
-
 def scan_existing(db):
     with db:
         cursor = db.cursor()
@@ -297,20 +305,29 @@ def scan_existing(db):
         for song_id, file_path in existing_songs:
             if not os.path.exists(file_path):
                 cursor.execute('DELETE FROM songs WHERE id = ?', (song_id,))
-                print(f'Removed song {song_id} (no longer exists)', end='\r')
+                print(f'Removed song {song_id} (no longer exists)')
                 sys.stdout.flush()
             else:
                 modified_date = datetime.fromtimestamp(os.path.getmtime(file_path))
-                cursor.execute('SELECT modified_date, has_lyrics FROM songs WHERE id = ?', (song_id,))
-                current_modified_date, current_has_lyrics = cursor.fetchone()
+                cursor.execute('SELECT modified_date FROM songs WHERE id = ?', (song_id,))
+                current_modified_date = cursor.fetchone()[0]
 
                 if modified_date != current_modified_date:
-                    has_lyrics = detect_lyrics(file_path)
-                    if has_lyrics != current_has_lyrics:
-                        db.execute('UPDATE songs SET modified_date = ?, has_lyrics = ? WHERE id = ?',
-                                (modified_date, has_lyrics, song_id))
-                        print(f'Updated song {song_id}', end='\r')
-                        sys.stdout.flush()
+                    process_song_file(file_path, db, cache_dir)
+                    # db.execute('UPDATE songs SET modified_date = ? WHERE id = ?', (modified_date, song_id))
+                    print(f'Updated song {song_id}')
+                    # sys.stdout.flush()
+
+
+                cursor.execute('SELECT has_lyrics FROM songs WHERE id = ?', (song_id,))
+                current_has_lyrics = cursor.fetchone()[0]
+                has_lyrics = detect_lyrics(file_path)
+
+                if has_lyrics != current_has_lyrics:
+                    db.execute('UPDATE songs SET has_lyrics = ? WHERE id = ?', (has_lyrics, song_id))
+                    print(f'Updated lyrics status for song {song_id}')
+                    sys.stdout.flush()
+
 
 
 def scan_all_dirs():

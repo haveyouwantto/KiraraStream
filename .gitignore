@@ -2,3 +2,5 @@ __pycache__
 .cache
 *.db
 music/
+config.json
+.vscode
